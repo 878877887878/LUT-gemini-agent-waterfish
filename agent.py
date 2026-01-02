@@ -46,36 +46,49 @@ DANGEROUS_COMMANDS = [
     'shutdown', 'restart', 'rm -rf'
 ]
 
-# LUT 來源清單（知名相機廠牌和免費資源）
+# LUT 來源清單（真實可下載的開源 LUT）
 LUT_SOURCES = {
-    "fujifilm": {
-        "name": "Fujifilm 電影模擬",
+    "open_color_io": {
+        "name": "OpenColorIO 標準 LUT",
         "luts": [
-            {"name": "Fuji_Classic_Chrome", "url": "https://example.com/fuji_classic_chrome.cube"},
-            {"name": "Fuji_Pro_Neg_Std", "url": "https://example.com/fuji_pro_neg.cube"},
-            {"name": "Fuji_Velvia", "url": "https://example.com/fuji_velvia.cube"},
+            {
+                "name": "ACES_Proxy_to_ACES",
+                "url": "https://raw.githubusercontent.com/colour-science/colour/develop/colour/io/luts/tests/resources/iridas_cube/ACES_Proxy_10_to_ACES.cube"
+            },
+            {
+                "name": "Cinematic_Look",
+                "url": "https://raw.githubusercontent.com/mikrosimage/OpenColorIO-Configs/master/aces_1.0.3/luts/arri/logc3/Bourbon_64.cube"
+            },
+        ]
+    },
+    "fujifilm": {
+        "name": "Fujifilm 電影模擬（範例）",
+        "luts": [
+            {"name": "Fuji_Classic_Chrome", "url": "local_generate"},  # 本地生成
+            {"name": "Fuji_Pro_Neg_Std", "url": "local_generate"},
+            {"name": "Fuji_Velvia", "url": "local_generate"},
         ]
     },
     "sony": {
-        "name": "Sony 創意風格",
+        "name": "Sony 創意風格（範例）",
         "luts": [
-            {"name": "Sony_SGamut3Cine", "url": "https://example.com/sony_sgamut.cube"},
-            {"name": "Sony_S-Log3", "url": "https://example.com/sony_slog3.cube"},
+            {"name": "Sony_SGamut3Cine", "url": "local_generate"},
+            {"name": "Sony_S-Log3", "url": "local_generate"},
         ]
     },
     "canon": {
-        "name": "Canon 色彩風格",
+        "name": "Canon 色彩風格（範例）",
         "luts": [
-            {"name": "Canon_Neutral", "url": "https://example.com/canon_neutral.cube"},
-            {"name": "Canon_Cinema", "url": "https://example.com/canon_cinema.cube"},
+            {"name": "Canon_Neutral", "url": "local_generate"},
+            {"name": "Canon_Cinema", "url": "local_generate"},
         ]
     },
     "free_pack": {
         "name": "免費精選包",
         "luts": [
-            {"name": "Vintage_Warm", "url": "https://example.com/vintage_warm.cube"},
-            {"name": "Cinematic_Teal", "url": "https://example.com/cinematic_teal.cube"},
-            {"name": "Black_White_Contrast", "url": "https://example.com/bw_contrast.cube"},
+            {"name": "Vintage_Warm", "url": "local_generate"},
+            {"name": "Cinematic_Teal", "url": "local_generate"},
+            {"name": "Black_White_Contrast", "url": "local_generate"},
         ]
     }
 }
@@ -329,24 +342,33 @@ class LUTManager:
         return sorted(lut_files)
 
     def download_lut(self, name, url):
-        """下載 LUT 檔案"""
+        """下載 LUT 檔案（真實網路下載）"""
         try:
             console.print(f"[yellow]⬇️ 下載 LUT: {name}...[/]")
-
-            # 實際應用中，這裡應該從真實 URL 下載
-            # 目前創建一個示例 LUT 檔案
             lut_path = os.path.join(self.lut_dir, f"{name}.cube")
 
-            # 模擬下載（實際應用中使用 requests.get）
-            # response = requests.get(url, timeout=30)
-            # with open(lut_path, 'wb') as f:
-            #     f.write(response.content)
+            # 嘗試真實下載
+            try:
+                import requests
+                response = requests.get(url, timeout=30, headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                })
+                response.raise_for_status()
 
-            # 目前創建一個基本的 Identity LUT 作為示例
-            self.create_sample_lut(lut_path, name)
+                # 儲存下載的檔案
+                with open(lut_path, 'wb') as f:
+                    f.write(response.content)
 
-            console.print(f"[green]✅ {name} 下載完成[/]")
-            return True, lut_path
+                console.print(f"[green]✅ {name} 從網路下載完成[/]")
+                return True, lut_path
+
+            except (ImportError, Exception) as e:
+                # 如果網路下載失敗，創建範例 LUT
+                console.print(f"[yellow]⚠️ 網路下載失敗，創建範例 LUT: {e}[/]")
+                self.create_sample_lut(lut_path, name)
+                console.print(f"[green]✅ {name} 範例 LUT 創建完成[/]")
+                return True, lut_path
+
         except Exception as e:
             console.print(f"[red]❌ 下載失敗: {e}[/]")
             return False, str(e)
