@@ -19,6 +19,7 @@ from rich.markdown import Markdown
 from rich.progress import track, Progress, SpinnerColumn, TextColumn, BarColumn
 from rich.table import Table
 from rich.tree import Tree
+import difflib
 
 # ================= 設定區 =================
 load_dotenv()
@@ -318,6 +319,73 @@ class GitManager:
         except Exception as e:
             return f"錯誤: {e}"
 
+# ============ 濾鏡分析系統 ================
+class LUTAnalyzer:
+    """LUT 視覺指紋分析器：分析 LUT 的色調特性"""
+    
+    def get_lut_tags(self, lut_path):
+        try:
+            # 1. 建立測試圖 (極小尺寸 4x1 像素，加速運算)
+            # 分別代表：[中性灰, 暗部, 亮部, 膚色]
+            src_pixels = [
+                (128, 128, 128), 
+                (50, 50, 50),    
+                (200, 200, 200), 
+                (180, 150, 130)  
+            ]
+            img = PIL.Image.new("RGB", (4, 1))
+            img.putdata(src_pixels)
+
+            # 2. 套用 LUT
+            # 注意：這裡會暫時載入 LUT 檔案來運算
+            lut = load_cube_file(lut_path)
+            out_img = img.filter(lut)
+            out_pixels = list(out_img.getdata())
+
+            tags = []
+            
+            # --- A. 分析色溫 (冷暖調) ---
+            # 比較中性灰(128)的 R 與 B 通道變化
+            gray_src = src_pixels[0]
+            gray_out = out_pixels[0]
+            
+            r_diff = gray_out[0] - gray_src[0] # 紅色增量
+            b_diff = gray_out[2] - gray_src[2] # 藍色增量
+            
+            if b_diff > r_diff + 5:
+                tags.append("冷色調(Cool)")
+            elif r_diff > b_diff + 5:
+                tags.append("暖色調(Warm)")
+            else:
+                tags.append("中性色(Neutral)")
+
+            # --- B. 分析明度 (亮暗) ---
+            avg_src = sum(gray_src) / 3
+            avg_out = sum(gray_out) / 3
+            if avg_out > avg_src + 15:
+                tags.append("高明度(Bright)")
+            elif avg_out < avg_src - 15:
+                tags.append("低明度(Dark)")
+
+            # --- C. 分析對比度 ---
+            # 比較 (亮部 - 暗部) 的距離是否被拉開或壓縮
+            contrast_src = src_pixels[2][0] - src_pixels[1][0]
+            contrast_out = out_pixels[2][0] - out_pixels[1][0]
+            
+            if contrast_out < contrast_src - 20:
+                tags.append("低反差(Low Contrast)") # 日系常見
+            elif contrast_out > contrast_src + 20:
+                tags.append("高反差(High Contrast)") # 電影常見
+
+            # --- D. 特殊風格 (褪色感) ---
+            # 檢查暗部(原本50)是否被提亮很多
+            if out_pixels[1][0] > 60:
+                tags.append("褪色感(Faded)")
+
+            return ", ".join(tags)
+
+        except Exception as e:
+            return "未分析"
 
 # ================= LUT 濾鏡管理系統 =================
 
@@ -355,37 +423,64 @@ class LUTManager:
 
         return sorted(lut_files)
 
-    def download_lut(self, name, url):
-        """下載 LUT 檔案（真實網路下載）"""
-        try:
-            console.print(f"[yellow]⬇️ 下載 LUT: {name}...[/]")
-            lut_path = os.path.join(self.lut_dir, f"{name}.cube")
+    def load_lut(self, lut_name):
+        """載入 LUT (支援超強模糊搜尋：自動補全、忽略底線、拼字修正)"""
+        if not lut_name: return None
+        
+        # 1. 取得所有可用的 LUT 路徑清單 (作為搜尋資料庫)
+        # 為了效能，這裡暫時重新掃描一次，或你可以存成 self.all_luts_cache
+        all_luts = []
+        for root, _, files in os.walk(self.lut_dir):
+            for file in files:
+                if file.lower().endswith('.cube'):
+                    all_luts.append(os.path.join(root, file))
 
-            # 嘗試真實下載
+        # 2. 定義一個「標準化名稱」的函式 (把 _ - 拿掉，轉小寫，方便比對)
+        def normalize(name):
+            return name.lower().replace("_", "").replace("-", "").replace(" ", "").replace(".cube", "")
+
+        target_norm = normalize(lut_name)
+        best_match_path = None
+        highest_score = 0.0
+
+        # 3. 開始比對
+        for path in all_luts:
+            filename = os.path.basename(path)
+            file_norm = normalize(filename)
+
+            # (A) 如果標準化後完全一樣 (例如 "SoftWarm" vs "Soft-Warm")
+            if target_norm == file_norm:
+                best_match_path = path
+                break
+            
+            # (B) 如果包含關係 (例如 "Kodak" 包含在 "Kodak_Portra_400" 裡面)
+            if target_norm in file_norm:
+                # 記錄起來，但繼續找有沒有更像的
+                best_match_path = path 
+                break
+
+            # (C) 使用 difflib 計算相似度 (處理拼字錯誤)
+            score = difflib.SequenceMatcher(None, target_norm, file_norm).ratio()
+            if score > 0.6 and score > highest_score:  # 相似度大於 60% 才算
+                highest_score = score
+                best_match_path = path
+
+        # 4. 載入找到的檔案
+        if best_match_path and os.path.exists(best_match_path):
             try:
-                import requests
-                response = requests.get(url, timeout=30, headers={
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                })
-                response.raise_for_status()
-
-                # 儲存下載的檔案
-                with open(lut_path, 'wb') as f:
-                    f.write(response.content)
-
-                console.print(f"[green]✅ {name} 從網路下載完成[/]")
-                return True, lut_path
-
-            except (ImportError, Exception) as e:
-                # 如果網路下載失敗，創建範例 LUT
-                console.print(f"[yellow]⚠️ 網路下載失敗，創建範例 LUT: {e}[/]")
-                self.create_sample_lut(lut_path, name)
-                console.print(f"[green]✅ {name} 範例 LUT 創建完成[/]")
-                return True, lut_path
-
-        except Exception as e:
-            console.print(f"[red]❌ 下載失敗: {e}[/]")
-            return False, str(e)
+                real_name = os.path.basename(best_match_path)
+                console.print(f"[dim]🔍 AI 推薦 '{lut_name}' -> 自動對應到 '{real_name}'[/]")
+                
+                # 存入快取
+                if lut_name not in self.lut_cache:
+                    self.lut_cache[lut_name] = load_cube_file(best_match_path)
+                return self.lut_cache[lut_name]
+            except Exception as e:
+                console.print(f"[red]⚠️ LUT 檔案損壞 ({best_match_path}): {e}[/]")
+                return None
+        
+        console.print(f"[red]❌ 找不到 LUT: '{lut_name}' (已嘗試模糊比對)[/]")
+        return None
 
     def create_sample_lut(self, path, name):
         """創建示例 LUT 檔案（Identity LUT）"""
@@ -516,6 +611,26 @@ class LUTManager:
             console.print(f"[red]❌ 套用 LUT 失敗: {e}[/]")
             return image
 
+    def get_lut_info_list(self):
+        """回傳包含 AI 分析標籤的 LUT 清單字串"""
+        analyzer = LUTAnalyzer()
+        lut_files = self.list_local_luts() # 呼叫之前改好的遞迴搜尋
+        
+        info_lines = []
+        console.print("[yellow]🔍 正在分析 LUT 光學特性 (建立索引中)...[/]")
+        
+        # 為了效能，這裡只列出前 20 個或是建立快取機制
+        # 實際應用建議將分析結果存成 json，不要每次重跑
+        for lut_rel_path in track(lut_files, description="分析視覺指紋"):
+            full_path = os.path.join(self.lut_dir, lut_rel_path)
+            
+            # 執行分析
+            tags = analyzer.get_lut_tags(full_path)
+            
+            # 格式: "- 檔名 (視覺特性: 冷色調, 低反差)"
+            info_lines.append(f"- {lut_rel_path} (特性: {tags})")
+            
+        return "\n".join(info_lines)
 
 # ================= 工具函數 =================
 
@@ -1091,6 +1206,11 @@ def generate_html_report(results: dict, output_path: str):
 
 # ================= 初始化 Gemini Agent =================
 
+# 1. 初始化並執行分析 (這行會跑進度條)
+temp_manager = LUTManager()
+lut_analysis_report = temp_manager.get_lut_info_list()
+
+# 2. 將清單注入到系統提示詞中   
 tools_list = [
     execute_terminal_command,
     batch_process_photos,
@@ -1099,8 +1219,19 @@ tools_list = [
     version_control
 ]
 
+# 3. 將分析結果注入 Prompt
 system_instruction = f"""
 你是一個運行在 Windows 電腦上的全能 AI 助手 🤖 (v{VERSION})
+
+**重要：LUT 濾鏡選擇指南**
+你擁有「視覺分析能力」。當使用者要求某種風格（如「日系」、「底片感」）時，
+請根據下方清單中的【特性】標籤來選擇，不要只看檔名。
+
+**日系/空氣感 (Japanese/Airy)：** 尋找 [冷色調]、[低反差]、[高明度]、[褪色感]
+**電影感 (Cinematic)：** 尋找 [高反差]、[暖色調] 或 [冷色調] (Teal & Orange)
+
+**目前已安裝的 LUT 及其實際光學特性：**
+{lut_analysis_report}
 
 **核心能力：**
 1. execute_terminal_command: 執行 Windows CMD 指令（含安全檢查）
