@@ -7,6 +7,7 @@ import google.generativeai as genai
 from dotenv import load_dotenv
 from PIL import Image
 
+# 忽略警告
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -19,6 +20,7 @@ from core.memory_manager import MemoryManager
 from core.security import execute_safe_command
 from core.logger import Logger
 
+# 系統初始化
 if sys.platform.startswith('win'):
     try:
         sys.stdout.reconfigure(encoding='utf-8')
@@ -33,7 +35,7 @@ if not API_KEY:
     print("❌ 錯誤: 請在 .env 設定 GEMINI_API_KEY")
     sys.exit(1)
 
-Logger.info("正在啟動 GUI 核心系統 (v13 Cinematic)...")
+Logger.info("正在啟動 GUI 核心系統 (v14 Log Adapter)...")
 memory_mgr = MemoryManager()
 lut_engine = LUTEngine()
 rag = KnowledgeBase()
@@ -45,35 +47,52 @@ if all_luts:
 planner = SmartPlanner(API_KEY, rag)
 
 
-# 工具函式
+# ================= 工具函式 =================
 def remember_user_preference(info: str):
     Logger.info(f"GUI 觸發記憶寫入: {info}")
     return memory_mgr.add_preference(info)
 
 
 def check_available_luts(keyword: str = ""):
+    """查詢本地 LUT 工具 (GUI 版)"""
     all_names = list(lut_engine.lut_index.keys())
     if keyword:
         filtered = [n for n in all_names if keyword.lower() in n]
         if not filtered:
-            return f"找不到包含 '{keyword}' 的濾鏡。"
-        return f"找到 {len(filtered)} 個相關濾鏡..."
-    return f"系統目前擁有 {len(all_names)} 個濾鏡。"
+            return f"找不到包含 '{keyword}' 的濾鏡，但系統共有 {len(names)} 個濾鏡。"
+        return f"找到 {len(filtered)} 個相關濾鏡，例如: {', '.join(filtered[:30])}..."
+    import random
+    sample = random.sample(all_names, min(len(all_names), 30))
+    return f"系統目前擁有 {len(all_names)} 個濾鏡。包含: {', '.join(sample)}... 等。"
 
 
-# 對話邏輯
+# ================= 對話邏輯 =================
 def create_chat_session():
     genai.configure(api_key=API_KEY)
+
     tools = [execute_safe_command, remember_user_preference, check_available_luts]
+
     base_prompt = """
     你是一個強大的 AI 助理 (Gemini 3 Pro)。
-    【行為準則】引導使用圖片模式、執行白名單指令、記憶偏好。
+    這是一個 GUI 介面環境。
+
+    【安全守則】
+    1. 執行指令前，請使用 execute_safe_command。
+
+    【核心行為準則】
+    1. 圖片處理：如果使用者上傳圖片或要求修圖，請引導他們切換到「👁️ 智能視覺修圖」分頁。
+    2. 系統指令：可以使用 execute_safe_command 執行白名單指令。
+    3. 記憶能力：如果使用者提到個人偏好，請務必使用 remember_user_preference 工具儲存。
+    4. 語言風格：請使用繁體中文，回答親切且專業。
     """
+
     dynamic_context = memory_mgr.get_system_prompt_addition()
+    final_prompt = base_prompt + dynamic_context
+
     model = genai.GenerativeModel(
         model_name='gemini-3-pro-preview',
         tools=tools,
-        system_instruction=base_prompt + dynamic_context
+        system_instruction=final_prompt
     )
     return model.start_chat(enable_automatic_function_calling=True)
 
@@ -81,6 +100,7 @@ def create_chat_session():
 def chat_response(message, history, session_state):
     if session_state is None:
         session_state = create_chat_session()
+
     try:
         Logger.debug(f"GUI 對話請求: {message}")
         response = session_state.send_message(message)
@@ -90,11 +110,14 @@ def chat_response(message, history, session_state):
         return f"❌ 發生錯誤: {str(e)}", session_state
 
 
-# ================= 視覺邏輯 (v13 Update) =================
+# ================= 視覺邏輯 (v14 Update) =================
 def process_image_smartly(image, user_req):
     Logger.info(f"GUI 觸發修圖，需求: {user_req}")
-    if image is None: return None, "❌ 請先上傳圖片"
-    if not user_req: user_req = "自動調整"
+    if image is None:
+        return None, "❌ 請先上傳圖片"
+
+    if not user_req:
+        user_req = "自動調整，讓照片更好看"
 
     temp_path = "temp_gui_input.jpg"
     image.save(temp_path)
@@ -104,7 +127,7 @@ def process_image_smartly(image, user_req):
     if not plan or not plan.get('selected_lut'):
         return None, f"⚠️ AI 思考失敗: {plan.get('reasoning', '未知錯誤')}"
 
-    # v13 傳遞所有新參數 (含 Curve/Sharpness)
+    # v14 傳遞完整參數
     final_img, msg = lut_engine.apply_lut(
         temp_path,
         plan['selected_lut'],
@@ -114,18 +137,22 @@ def process_image_smartly(image, user_req):
         temperature=plan.get('temperature', 0.0),
         tint=plan.get('tint', 0.0),
         contrast=plan.get('contrast', 1.0),
-        curve=plan.get('curve', 'Linear'),  # 新增
-        sharpness=plan.get('sharpness', 1.0)  # 新增
+        curve=plan.get('curve', 'Linear'),
+        sharpness=plan.get('sharpness', 1.0),
+        simulate_log=plan.get('simulate_log', False)  # [v14]
     )
 
-    # v13 專業報告
-    report = f"""### 🎨 AI 調色師報告 (v13)
+    # v14 專業報告
+    log_status = "**啟用** (Log Simulation)" if plan.get('simulate_log') else "關閉"
+
+    report = f"""### 🎨 AI 調色師報告 (v14)
 **技術分析**: {plan.get('technical_analysis', '無')}
 **調色策略**: {plan.get('style_strategy', '無')}
 
 | 參數類別 | 設定值 |
 | :--- | :--- |
 | **LUT** | `{plan.get('selected_lut')}` (強度 {plan.get('intensity')}) |
+| **Log 模擬** | `{log_status}` |
 | **色彩平衡** | Temp: `{plan.get('temperature')}` / Tint: `{plan.get('tint')}` |
 | **曝光質感** | Curve: `{plan.get('curve')}` / Bright: `{plan.get('brightness')}` |
 | **細節** | Sharpness: `{plan.get('sharpness')}` / Contrast: `{plan.get('contrast')}` |
@@ -138,24 +165,30 @@ def process_image_smartly(image, user_req):
 def get_current_memory():
     mem = memory_mgr._load_memory()
     prefs = mem.get("user_preferences", [])
-    if not prefs: return "目前沒有記憶資料。"
+    if not prefs:
+        return "目前沒有記憶資料。"
     return "\n".join([f"- {p}" for p in prefs])
 
 
-# GUI 建構
-with gr.Blocks(title="Gemini Agent v13 (Cinematic)") as app:
-    gr.Markdown("# 🤖 Gemini Agent v13 (Cinematic Grade)")
-    gr.Markdown("引擎特色：`Log LUT 防呆` + `S-Curve 電影曲線` + `Tint 膚色校正`")
+# ================= GUI 建構 =================
+with gr.Blocks(title="Gemini Agent v14 (GUI)") as app:
+    gr.Markdown("# 🤖 Gemini Agent v14 (Log Adapter)")
+    gr.Markdown("引擎特色：`Log 模擬器` + `S-Curve 電影曲線` + `Tint 膚色校正`")
 
     chat_state = gr.State(None)
 
     with gr.Tabs():
+        # Tab 1: 修圖
         with gr.TabItem("👁️ 智能視覺修圖"):
             with gr.Row():
                 with gr.Column(scale=1):
                     input_img = gr.Image(type="pil", label="上傳圖片")
-                    style_input = gr.Textbox(label="風格需求", placeholder="日系冷白、電影感...", lines=2)
-                    btn_process = gr.Button("🚀 開始 v13 修圖", variant="primary")
+                    style_input = gr.Textbox(
+                        label="風格需求",
+                        placeholder="例如：日系冷白、王家衛風格、用我記憶中的招牌風格...",
+                        lines=2
+                    )
+                    btn_process = gr.Button("🚀 開始 AI 修圖 (v14)", variant="primary")
                 with gr.Column(scale=1):
                     output_img = gr.Image(label="處理結果", type="pil")
                     output_info = gr.Markdown(label="AI 思考報告")
@@ -165,9 +198,10 @@ with gr.Blocks(title="Gemini Agent v13 (Cinematic)") as app:
                 outputs=[output_img, output_info]
             )
 
-        with gr.TabItem("💬 核心大腦"):
+        # Tab 2: 對話
+        with gr.TabItem("💬 核心大腦 (Chat & Memory)"):
             chatbot = gr.Chatbot(height=500)
-            msg_input = gr.Textbox(label="User", placeholder="聊天或指令...")
+            msg_input = gr.Textbox(placeholder="輸入文字... (例如：'我有什麼濾鏡?' 或 'git status')", label="User")
 
 
             def user_msg(user_message, history):
@@ -185,10 +219,17 @@ with gr.Blocks(title="Gemini Agent v13 (Cinematic)") as app:
                 bot_msg, [chatbot, chat_state], [chatbot, chat_state]
             )
 
-        with gr.TabItem("🧠 記憶庫"):
-            memory_display = gr.Textbox(label="User Memory", value=get_current_memory(), lines=10, interactive=False)
-            btn_refresh = gr.Button("🔄 重新讀取")
-            btn_refresh.click(get_current_memory, outputs=memory_display)
+        # Tab 3: 記憶
+        with gr.TabItem("🧠 大腦記憶庫"):
+            gr.Markdown("以下是 AI 目前記住的關於您的偏好與規則：")
+            memory_display = gr.Textbox(
+                label="User Memory (user_memory.json)",
+                value=get_current_memory(),
+                lines=10,
+                interactive=False
+            )
+            btn_refresh_mem = gr.Button("🔄 重新讀取記憶")
+            btn_refresh_mem.click(get_current_memory, outputs=memory_display)
 
 if __name__ == "__main__":
     app.queue().launch(inbrowser=True, server_name="127.0.0.1")

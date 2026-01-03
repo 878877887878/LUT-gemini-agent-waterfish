@@ -27,42 +27,38 @@ class SmartPlanner:
 
         available_luts = self.rag.search(user_request, n_results=60)
 
-        # v13 Prompt: 加入 Log LUT 防呆與曲線控制
+        # v14 Prompt: Log LUT 適配邏輯
         prompt = f"""
-        你是一位好萊塢等級的 DI 調色師。請分析這張圖片並制定修圖計畫。
+        你是一位好萊塢等級的 DI 調色師。
+        【使用者痛點】使用者擁有大量 Log LUT (如 F-Log to ETERNA)，但輸入的圖片是手機直出 (Rec709)。直接套用會導致「烤焦」效果。
+        【你的任務】分析圖片，若選用 Log LUT，必須啟用 `simulate_log` 參數來「洗白」圖片。
 
-        【使用者需求】
-        "{user_request}"
-
-        【 📚 可用 LUT 資源庫 】
+        【可用資源】
         {available_luts}
 
-        【 ⚠️ 關鍵守則：Log LUT 防呆 】
-        1. **檢查檔名**：如果圖片看起來是標準對比 (JPG/PNG 直出)，**絕對禁止** 選擇檔名包含 "Log", "FLog", "SLog", "VLog", "Raw" 的技術還原 LUT。
-        2. **後果**：在普通照片上套用 Log LUT 會導致膚色爆紅、暗部死黑（如使用者抱怨的「烤焦」效果）。
-        3. **替代方案**：請優先選擇帶有 "Rec709", "Standard", "Film", "Creative" 或無特殊標記的風格化 LUT。
-
-        【 🛠️ 參數決策 (細膩度優先) 】
-        1. **富士/膠片感 (Fuji/Film Look)**: 
-           - 重點是「通透感」與「柔和高光」。不要過度增加對比。
-           - 若原圖已是數位直出，通常需要 `contrast: 0.9` (降低數位銳利感) 甚至 `0.85`。
-           - 膚色保護：若原圖偏紅，請用 `tint: -0.1` (往綠偏移) 來校正。
-        2. **參數定義**:
-           - `curve`: "S-Curve" (電影感), "Linear" (無), "Soft-High" (柔化高光), "Lift-Shadow" (拉提暗部)
-           - `sharpness`: 銳利度 (0.0~2.0, 富士感通常設 0.8 讓畫質軟一點)
+        【 🛠️ 決策邏輯 】
+        1. **LUT 選擇**: 優先尋找符合風格的 LUT。
+        2. **Log 偵測**: 
+           - 如果 selected_lut 的檔名包含 "Log", "Raw", "Flat", "V-Log", "S-Log", "F-Log" 等字眼。
+           - 且原圖是標準對比 (JPG)。
+           - **必須設定 `simulate_log: true`**。
+        3. **一般參數**:
+           - `curve`: "Soft-High" (推薦用於 Log 模擬模式，柔化高光)
+           - `intensity`: 若啟用 Log 模擬，強度可設為 1.0 (因為底圖已經變灰了)；若無模擬，Log LUT 強度需降至 0.3。
 
         請回傳 **純 JSON 格式**：
         {{
-            "technical_analysis": "原圖為標準 Rec709 直出，膚色受室內光影響偏暖...",
-            "style_strategy": "避開 F-Log LUT，選擇標準膠片模擬 LUT。降低數位銳利度，使用 S 曲線營造層次...",
-            "selected_lut": "非Log的風格檔名.cube",
-            "intensity": 0.6,
+            "technical_analysis": "原圖為 Rec709，但目標風格需要使用 F-Log 專用 LUT...",
+            "style_strategy": "啟用 Log 模擬模式 (Simulate Log)，將原圖轉為低對比灰片，再套用 ETERNA LUT 以獲得正確色彩。",
+            "selected_lut": "XH2S_FLog_..._ETERNA.cube",
+            "simulate_log": true, 
+            "intensity": 1.0,
             "brightness": 1.0,
-            "contrast": 0.9,
-            "saturation": 0.9,
-            "temperature": -0.1,
+            "contrast": 1.0,
+            "saturation": 1.0,
+            "temperature": 0.0,
             "tint": 0.0,
-            "curve": "Soft-High", 
+            "curve": "Soft-High",
             "sharpness": 0.9,
             "caption": "..."
         }}
@@ -79,16 +75,19 @@ class SmartPlanner:
 
             img_file = genai.upload_file(temp_thumb)
             response = self.model.generate_content([prompt, img_file])
-            Logger.debug(f"AI 思考: {response.text[:100]}...")
 
             plan = self._extract_json(response.text)
 
-            # v13 強制防呆檢查 (Double Check)
+            # v14 雙重防呆: 如果檔名有 Log 但 AI 忘了開模擬，幫它開
             if plan and plan.get('selected_lut'):
                 lut_name = plan['selected_lut'].lower()
-                if any(x in lut_name for x in ['log', 'raw']) and plan.get('intensity', 1.0) > 0.4:
-                    Logger.warn(f"AI 選到了 Log LUT ({lut_name}) 但原圖似乎是 JPG。強制降低強度。")
-                    plan['intensity'] = 0.3  # 強制壓低強度以挽救畫質
+                is_log_lut = any(x in lut_name for x in ['log', 'raw', 'flat'])
+
+                # 如果是 Log LUT 且沒有設定模擬，強制開啟
+                if is_log_lut and not plan.get('simulate_log'):
+                    Logger.warn(f"偵測到 Log LUT ({lut_name})，強制啟用 Log 模擬模式！")
+                    plan['simulate_log'] = True
+                    plan['intensity'] = 1.0  # 恢復強度，因為底圖已經變灰了
 
             return plan
 

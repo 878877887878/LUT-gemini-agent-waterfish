@@ -1,14 +1,12 @@
 import os
-import math
-import numpy as np
 import PIL.Image
 import PIL.ImageOps
 import PIL.ImageEnhance
-import PIL.ImageFilter
 from pillow_lut import load_cube_file
 from functools import lru_cache
 from collections import defaultdict
 import difflib
+import numpy as np
 from core.logger import Logger
 
 
@@ -38,47 +36,34 @@ class LUTEngine:
     def _get_lut_object(self, lut_path):
         return load_cube_file(lut_path)
 
-    def _apply_curve(self, img, curve_type):
+    def _simulate_log_curve(self, img):
         """
-        v13 電影級曲線應用
-        不使用粗暴的 Contrast，而是使用查找表 (Lookup Table) 進行曲線映射
+        v14 關鍵技術：將 Rec.709 照片「洗白」成偽 Log
+        透過降低對比、提亮暗部、壓縮高光，創造適合 Log LUT 的灰底。
         """
-        if curve_type == "Linear" or not curve_type:
-            return img
+        Logger.debug("執行 Log 模擬 (將照片變灰以適配 Log LUT)...")
 
-        Logger.debug(f"套用色調曲線: {curve_type}")
+        # 1. 大幅降低對比 (變平)
+        img = PIL.ImageEnhance.Contrast(img).enhance(0.6)
 
-        # 建立 0-255 的映射表
-        x = np.arange(256)
+        # 2. 降低飽和度 (Log 通常飽和度低)
+        img = PIL.ImageEnhance.Color(img).enhance(0.7)
 
-        if curve_type == "S-Curve":
-            # 經典 S 型: 壓暗部、提亮部 (增加對比但保留中間調)
-            # 使用 Sigmoid 函數模擬
-            factor = 5  # 曲線強度
-            y = 255 / (1 + np.exp(-factor * (x / 255 - 0.5)))
-            # 正規化回 0-255
-            y = (y - y.min()) * 255 / (y.max() - y.min())
+        # 3. 提升亮度 (Log 的暗部通常是灰的不是黑的)
+        img = PIL.ImageEnhance.Brightness(img).enhance(1.1)
 
-        elif curve_type == "Soft-High":
-            # 富士風格: 柔化高光 (高光壓縮)
-            # x > 128 的部分斜率變緩
-            y = np.where(x < 128, x, 128 + (x - 128) * 0.8)
+        # 4. Gamma 修正 (讓中間調更灰)
+        # 這裡用簡單的曲線模擬 Log 的 lift
+        r, g, b = img.split()
+        lift_curve = lambda x: int(x * 0.9 + 15)  # 簡單的線性提亮
+        r = r.point(lift_curve)
+        g = g.point(lift_curve)
+        b = b.point(lift_curve)
 
-        elif curve_type == "Lift-Shadow":
-            # 膠片風格: 提亮暗部 (暗部不在此死黑)
-            # x < 64 的部分被提亮
-            y = np.where(x > 64, x, x + (64 - x) * 0.3)
-
-        else:
-            return img
-
-        # 應用映射表 (針對 RGB 三通道)
-        table = y.astype(np.uint8).tolist() * 3
-        return img.point(table)
+        return PIL.Image.merge("RGB", (r, g, b))
 
     def _adjust_white_balance(self, img, temp_val, tint_val):
         if temp_val == 0 and tint_val == 0: return img
-        # (保留 v12 的白平衡算法，這部分沒問題)
         r, g, b = img.split()
         r_factor = 1.0 + (temp_val * 0.25)
         b_factor = 1.0 - (temp_val * 0.25)
@@ -88,34 +73,50 @@ class LUTEngine:
         b = b.point(lambda i: int(min(255, max(0, i * b_factor))))
         return PIL.Image.merge("RGB", (r, g, b))
 
+    def _apply_curve(self, img, curve_type):
+        if curve_type == "Linear" or not curve_type: return img
+        # (保留 v13 的曲線邏輯)
+        x = np.arange(256)
+        if curve_type == "S-Curve":
+            factor = 5
+            y = 255 / (1 + np.exp(-factor * (x / 255 - 0.5)))
+            y = (y - y.min()) * 255 / (y.max() - y.min())
+        elif curve_type == "Soft-High":
+            y = np.where(x < 128, x, 128 + (x - 128) * 0.8)
+        elif curve_type == "Lift-Shadow":
+            y = np.where(x > 64, x, x + (64 - x) * 0.3)
+        else:
+            return img
+        table = y.astype(np.uint8).tolist() * 3
+        return img.point(table)
+
     def apply_lut(self, image_path, lut_name_or_path, intensity=1.0,
                   brightness=1.0, saturation=1.0, temperature=0.0, tint=0.0,
-                  contrast=1.0, curve="Linear", sharpness=1.0):
-        """
-        v13: 加入 Curve 與 Sharpness 參數
-        """
+                  contrast=1.0, curve="Linear", sharpness=1.0,
+                  simulate_log=False):  # [v14 新增參數]
         try:
             with PIL.Image.open(image_path) as im:
                 img = PIL.ImageOps.exif_transpose(im).convert("RGB")
 
-            # 1. 基礎校正 (Pre-processing)
+            # --- Step 0: Log Simulation (v14 新增) ---
+            # 如果 AI 判斷這是一個 Log LUT，我們先把照片變灰！
+            if simulate_log:
+                img = self._simulate_log_curve(img)
+
+            # --- Step 1: Pre-processing ---
             if brightness != 1.0:
                 img = PIL.ImageEnhance.Brightness(img).enhance(brightness)
             if temperature != 0 or tint != 0:
                 img = self._adjust_white_balance(img, temperature, tint)
-
-            # v13 改進: 對比度改在曲線前做，或者直接用曲線取代
             if contrast != 1.0:
                 img = PIL.ImageEnhance.Contrast(img).enhance(contrast)
-
             if saturation != 1.0:
                 img = PIL.ImageEnhance.Color(img).enhance(saturation)
 
-            # 2. 曲線應用 (v13 New Feature)
-            # 這是創造「富士感」或「電影感」的關鍵，比單純 Contrast 細膩
+            # --- Step 2: Curve ---
             img = self._apply_curve(img, curve)
 
-            # 3. LUT 搜尋與套用
+            # --- Step 3: LUT ---
             target_path = None
             if os.path.exists(lut_name_or_path):
                 target_path = lut_name_or_path
@@ -130,32 +131,21 @@ class LUTEngine:
                     if matches: target_path = self.lut_index[matches[0]][0]
 
             if not target_path:
-                Logger.error(f"找不到 LUT: {lut_name_or_path}")
-                # 找不到 LUT 至少回傳修整過基礎參數的圖
                 return img, "找不到 LUT，僅執行基礎修圖"
 
-            # 強度 clamp
             intensity = max(0.0, min(1.0, float(intensity)))
-
-            # Log LUT 自動偵測防護 (如果 AI 沒擋住，這裡做最後一道防線)
-            if "log" in os.path.basename(target_path).lower() and intensity > 0.4:
-                Logger.warn("引擎偵測到 Log LUT，自動降低強度以避免畫質破壞。")
-                intensity = 0.35
-
             try:
                 lut = self._get_lut_object(target_path)
                 filtered_img = img.filter(lut)
             except Exception as e:
                 return None, f"LUT 檔案損壞: {e}"
 
-            # 混合
             if intensity < 1.0:
                 final_img = PIL.Image.blend(img, filtered_img, intensity)
             else:
                 final_img = filtered_img
 
-            # 4. 銳利度調整 (Post-processing)
-            # 數位照片通常太銳利，降低銳利度可以增加膠片感
+            # --- Step 4: Post-processing ---
             if sharpness != 1.0:
                 final_img = PIL.ImageEnhance.Sharpness(final_img).enhance(sharpness)
 
