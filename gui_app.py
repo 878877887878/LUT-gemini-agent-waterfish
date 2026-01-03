@@ -1,27 +1,23 @@
 import gradio as gr
 import os
 import sys
-import asyncio
 import warnings
-import google.generativeai as genai
 from dotenv import load_dotenv
 from PIL import Image
 
 # 忽略警告
-warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", category=UserWarning)
-
+warnings.filterwarnings("ignore")
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-# 匯入 v16 核心模組
+# 匯入 v16.2 核心組件
 from core.lut_engine import LUTEngine
 from core.rag_core import KnowledgeBase
 from core.smart_planner import SmartPlanner
 from core.memory_manager import MemoryManager
 from core.security import execute_safe_command
 from core.logger import Logger
+from core.gemini_client import GeminiClient  # [v16.2 New]
 
-# 系統初始化
 if sys.platform.startswith('win'):
     try:
         sys.stdout.reconfigure(encoding='utf-8')
@@ -36,25 +32,32 @@ if not API_KEY:
     print("❌ 錯誤: 請在 .env 設定 GEMINI_API_KEY")
     sys.exit(1)
 
-Logger.info("正在啟動 GUI 核心系統 (v16 The Alchemist)...")
+Logger.info("正在啟動 GUI (v16.2 Unified Memory)...")
+
+# 初始化
 memory_mgr = MemoryManager()
 lut_engine = LUTEngine()
 rag = KnowledgeBase()
 
-# 索引建立
-all_luts = lut_engine.list_luts()
-if all_luts:
-    rag.index_luts(all_luts)
+try:
+    all_luts = lut_engine.list_luts()
+    if all_luts:
+        rag.index_luts(all_luts)
+except Exception:
+    pass
 
-planner = SmartPlanner(API_KEY, rag)
+# [v16.2] 傳入 lut_engine 與初始化 GeminiClient
+planner = SmartPlanner(API_KEY, rag, lut_engine)
+client = GeminiClient(API_KEY)
 
-# 用於儲存當前修圖狀態，供強化學習回饋使用
+# 用於儲存回饋狀態的 Global 變數
 current_context = {}
 
 
 # ================= 工具函式 =================
+
 def remember_user_preference(info: str):
-    Logger.info(f"GUI 觸發記憶寫入: {info}")
+    Logger.info(f"GUI 記憶: {info}")
     return memory_mgr.add_preference(info)
 
 
@@ -62,66 +65,90 @@ def check_available_luts(keyword: str = ""):
     all_names = list(lut_engine.lut_index.keys())
     if keyword:
         filtered = [n for n in all_names if keyword.lower() in n]
-        if not filtered:
-            return f"找不到包含 '{keyword}' 的濾鏡。"
-        return f"找到 {len(filtered)} 個相關濾鏡..."
+        if not filtered: return "無相關濾鏡。"
+        return f"找到 {len(filtered)} 個..."
+
+    # 隨機展示一些，避免塞爆畫面
     import random
-    sample = random.sample(all_names, min(len(all_names), 30))
-    return f"系統目前擁有 {len(all_names)} 個濾鏡。包含: {', '.join(sample)}... 等。"
+    sample_size = min(len(all_names), 30)
+    sample = random.sample(all_names, sample_size) if all_names else []
+    return f"共 {len(all_names)} 個濾鏡。包含: {', '.join(sample)}..."
 
 
-# ================= 對話邏輯 =================
-def create_chat_session():
-    genai.configure(api_key=API_KEY)
-    tools = [execute_safe_command, remember_user_preference, check_available_luts]
-    base_prompt = """
-    你是一個強大的 AI 助理 (Gemini 3 Pro)。
-    【行為準則】引導使用圖片模式、執行白名單指令、記憶偏好。
+def get_current_memory():
+    mem = memory_mgr._load_memory()
+    prefs = mem.get("user_preferences", [])
+    if not prefs: return "無資料"
+    return "\n".join([f"- {p}" for p in prefs])
+
+
+# ================= 對話邏輯 (Unified Memory) =================
+
+def get_or_create_session(session_state):
     """
-    dynamic_context = memory_mgr.get_system_prompt_addition()
-    model = genai.GenerativeModel(
-        model_name='gemini-3-pro-preview',
-        tools=tools,
-        system_instruction=base_prompt + dynamic_context
-    )
-    return model.start_chat(enable_automatic_function_calling=True)
-
-
-def chat_response(message, history, session_state):
+    確保 session 存在。使用 UnifiedChatSession 以支援模型輪詢。
+    """
     if session_state is None:
-        session_state = create_chat_session()
+        tools = [execute_safe_command, remember_user_preference, check_available_luts]
+        base_prompt = """
+        你是一個強大的 AI 助理 (Gemini 3 Pro)。
+        【能力】修圖、查詢濾鏡、記憶偏好。
+        請用繁體中文回答。
+        """
+        dynamic_context = memory_mgr.get_system_prompt_addition()
+
+        # 建立
+        session_state = client.create_unified_chat(
+            tools=tools,
+            system_instruction=base_prompt + dynamic_context
+        )
+        Logger.info("GUI: 已建立新的 Unified Chat Session")
+
+    return session_state
+
+
+def chat_response(user_message, history, session_state):
+    # 取得或建立 Session
+    session = get_or_create_session(session_state)
+
     try:
-        Logger.debug(f"GUI 對話請求: {message}")
-        response = session_state.send_message(message)
-        return response.text, session_state
+        Logger.debug(f"GUI 對話: {user_message}")
+        # 發送訊息 (自動輪詢模型)
+        response = session.send_message(user_message)
+
+        # Gradio 的 history 格式通常是 List of [user, bot]
+        # 但這裡我們使用 append 方式更新
+        history.append((user_message, response.text))
+        return "", history, session
+
     except Exception as e:
         Logger.error(f"GUI 對話錯誤: {e}")
-        return f"❌ 發生錯誤: {str(e)}", session_state
+        history.append((user_message, f"❌ 錯誤: {str(e)}"))
+        return "", history, session
 
 
-# ================= 視覺邏輯 (v16 Update) =================
+# ================= 視覺邏輯 =================
+
 def process_image_smartly(image, user_req):
-    Logger.info(f"GUI 觸發修圖，需求: {user_req}")
+    Logger.info(f"GUI 修圖需求: {user_req}")
     if image is None: return None, "❌ 請先上傳圖片"
     if not user_req: user_req = "自動調整"
 
+    # 存暫存檔給 AI 看
     temp_path = "temp_gui_input.jpg"
     image.save(temp_path)
 
-    # 1. 策劃
+    # 呼叫 Planner (內部使用 GeminiClient 自動輪詢)
     plan = planner.generate_plan(temp_path, user_req)
 
     if not plan or not plan.get('selected_lut'):
         return None, f"⚠️ AI 思考失敗: {plan.get('reasoning', '未知錯誤')}"
 
-    # 2. 暫存狀態 (為了之後的按讚/倒讚)
+    # 更新 Context 以供回饋使用
     global current_context
-    current_context = {
-        "req": user_req,
-        "plan": plan
-    }
+    current_context = {"req": user_req, "plan": plan}
 
-    # 3. 執行 v16 引擎 (含混合參數)
+    # 執行調色
     final_img, msg = lut_engine.apply_lut(
         temp_path,
         plan['selected_lut'],
@@ -131,124 +158,93 @@ def process_image_smartly(image, user_req):
         temperature=plan.get('temperature', 0.0),
         tint=plan.get('tint', 0.0),
         contrast=plan.get('contrast', 1.0),
-        curve_points=plan.get('curve_points'),  # [v15/16] 曲線點
+        curve_points=plan.get('curve_points'),
         sharpness=plan.get('sharpness', 1.0),
         simulate_log=plan.get('simulate_log', False),
-        secondary_lut=plan.get('secondary_lut'),  # [v16] 混合 LUT
-        mix_ratio=plan.get('mix_ratio', 0.0)  # [v16] 混合比例
+        secondary_lut=plan.get('secondary_lut'),
+        mix_ratio=plan.get('mix_ratio', 0.0)
     )
 
-    # 4. 生成報告
+    # 產生報告
     mix_info = ""
     if plan.get('secondary_lut'):
-        mix_info = f"<br>➕ 混合: `{plan.get('secondary_lut')}` (Ratio: {plan.get('mix_ratio')})"
+        mix_info = f"<br>➕ 混合: `{plan.get('secondary_lut')}` ({plan.get('mix_ratio')})"
 
-    curve_info = "自定義曲線 (Custom)" if plan.get('curve_points') else "線性 (Linear)"
+    curve_status = 'Custom' if plan.get('curve_points') else 'Linear'
 
-    report = f"""### 🧪 AI 煉金術報告 (v16)
-**技術分析**: {plan.get('technical_analysis', '無')}
-**調色策略**: {plan.get('style_strategy', '無')}
+    report = f"""### 🧪 決策報告 (v16.2)
+**策略**: {plan.get('style_strategy', '無')}
 
-| 參數類別 | 設定值 |
+| 參數 | 設定 |
 | :--- | :--- |
 | **LUT** | `{plan.get('selected_lut')}` {mix_info} |
-| **色彩平衡** | Temp: `{plan.get('temperature')}` / Tint: `{plan.get('tint')}` |
-| **曝光/曲線** | Bright: `{plan.get('brightness')}` / Curve: `{curve_info}` |
-| **其他** | Log模擬: `{plan.get('simulate_log')}` |
+| **強度** | {plan.get('intensity', 1.0)} |
+| **WB** | T:{plan.get('temperature')} / Tint:{plan.get('tint')} |
+| **Curve** | {curve_status} |
 
-> {plan.get('caption')}
+> {plan.get('caption', '完成')}
 """
     return final_img, report
 
 
 def send_feedback(is_positive):
-    """處理使用者回饋"""
     global current_context
-    if not current_context:
-        return "⚠️ 無法記錄：沒有最近的修圖紀錄"
-
+    if not current_context: return "⚠️ 無紀錄"
     score = 1 if is_positive else -1
-    # 呼叫 Planner 的學習接口
-    planner.learn_from_result(
-        current_context['req'],
-        current_context['plan'],
-        score
-    )
-
-    action = "學習此風格" if is_positive else "避免重犯"
-    return f"✅ 已記錄{'正向' if is_positive else '負向'}回饋！AI 將{action}。"
-
-
-def get_current_memory():
-    mem = memory_mgr._load_memory()
-    prefs = mem.get("user_preferences", [])
-    if not prefs: return "目前沒有記憶資料。"
-    return "\n".join([f"- {p}" for p in prefs])
+    planner.learn_from_result(current_context['req'], current_context['plan'], score)
+    return "✅ 已記錄" if is_positive else "❎ 已記錄"
 
 
 # ================= GUI 建構 =================
-with gr.Blocks(title="Gemini Agent v16 (The Alchemist)") as app:
-    gr.Markdown("# 🤖 Gemini Agent v16 (The Alchemist)")
-    gr.Markdown("核心能力：`強化學習` + `LUT 混合煉金術` + `曲線生成`")
 
+with gr.Blocks(title="Gemini Agent v16.2", theme=gr.themes.Soft()) as app:
+    gr.Markdown("# 🤖 Gemini Agent v16.2 (Unified Memory)")
+
+    # 這裡儲存我們的 UnifiedChatSession 物件 (跨請求持久化)
     chat_state = gr.State(None)
 
     with gr.Tabs():
         # Tab 1: 修圖
-        with gr.TabItem("👁️ 智能視覺修圖"):
+        with gr.TabItem("👁️ 智能修圖"):
             with gr.Row():
                 with gr.Column(scale=1):
-                    input_img = gr.Image(type="pil", label="上傳圖片")
-                    style_input = gr.Textbox(label="風格需求", placeholder="聖誕、日系、Cyberpunk...", lines=2)
-                    btn_process = gr.Button("🚀 開始 v16 煉金術修圖", variant="primary")
+                    input_img = gr.Image(type="pil", label="輸入圖片")
+                    style_input = gr.Textbox(label="風格需求", placeholder="例如：日系冷白、膠片感、高對比...")
+                    btn_process = gr.Button("🚀 開始煉金", variant="primary")
 
-                    # [v16] 回饋區塊
-                    gr.Markdown("### 🧠 訓練你的 AI")
+                    gr.Markdown("### 📝 結果回饋")
                     with gr.Row():
-                        btn_good = gr.Button("👍 滿意 (記住此風格)", variant="secondary")
-                        btn_bad = gr.Button("👎 不滿意 (下次改進)", variant="stop")
-                    feedback_msg = gr.Label(label="系統訊息", show_label=False)
+                        btn_good = gr.Button("👍 滿意 (學習)")
+                        btn_bad = gr.Button("👎 不滿意 (避雷)")
+                    feedback_msg = gr.Label(show_label=False)
 
                 with gr.Column(scale=1):
-                    output_img = gr.Image(label="處理結果", type="pil")
-                    output_info = gr.Markdown(label="AI 決策報告")
+                    output_img = gr.Image(label="修圖結果", type="pil")
+                    output_info = gr.Markdown()
 
             btn_process.click(
                 process_image_smartly,
                 inputs=[input_img, style_input],
                 outputs=[output_img, output_info]
             )
-
-            # 綁定回饋
             btn_good.click(lambda: send_feedback(True), outputs=feedback_msg)
             btn_bad.click(lambda: send_feedback(False), outputs=feedback_msg)
 
         # Tab 2: 對話
         with gr.TabItem("💬 核心大腦"):
-            chatbot = gr.Chatbot(height=500)
-            msg_input = gr.Textbox(label="User", placeholder="聊天或指令...")
+            chatbot = gr.Chatbot(height=500, label="Gemini 3 Pro")
+            msg_input = gr.Textbox(label="輸入訊息", placeholder="聊聊天，或查詢濾鏡...")
 
-
-            def user_msg(user_message, history):
-                return "", history + [[user_message, None]]
-
-
-            def bot_msg(history, state):
-                user_message = history[-1][0]
-                bot_response, new_state = chat_response(user_message, history, state)
-                history[-1][1] = bot_response
-                return history, new_state
-
-
-            msg_input.submit(user_msg, [msg_input, chatbot], [msg_input, chatbot], queue=False).then(
-                bot_msg, [chatbot, chat_state], [chatbot, chat_state]
+            msg_input.submit(
+                chat_response,
+                inputs=[msg_input, chatbot, chat_state],
+                outputs=[msg_input, chatbot, chat_state]
             )
 
         # Tab 3: 記憶
-        with gr.TabItem("🧠 大腦記憶庫"):
-            memory_display = gr.Textbox(label="User Memory", value=get_current_memory(), lines=10, interactive=False)
-            btn_refresh = gr.Button("🔄 重新讀取")
-            btn_refresh.click(get_current_memory, outputs=memory_display)
+        with gr.TabItem("🧠 記憶庫"):
+            memory_display = gr.Textbox(label="長期記憶", value=get_current_memory(), lines=10)
+            gr.Button("🔄 刷新記憶").click(get_current_memory, outputs=memory_display)
 
 if __name__ == "__main__":
     app.queue().launch(inbrowser=True, server_name="127.0.0.1")

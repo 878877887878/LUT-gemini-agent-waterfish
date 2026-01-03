@@ -1,8 +1,9 @@
 google-generativeai
-python-dotenv
-scipy
+pillow
 numpy
+scipy
+python-dotenv
 rich
-Pillow
-pillow-lut
+gradio
 chromadb
+pillow-lut
