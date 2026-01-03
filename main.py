@@ -11,14 +11,14 @@ from rich.table import Table
 from rich.markdown import Markdown
 from rich.progress import track
 
-# 匯入 v11 核心模組
+# 匯入 v12.1 核心模組
 from core.lut_engine import LUTEngine
 from core.rag_core import KnowledgeBase
 from core.smart_planner import SmartPlanner
 from core.memory_manager import MemoryManager
 from core.security import execute_safe_command
+from core.logger import Logger  # [新增]
 
-# ================= 系統設定 =================
 if sys.platform.startswith('win'):
     try:
         sys.stdout.reconfigure(encoding='utf-8')
@@ -31,73 +31,51 @@ API_KEY = os.getenv("GEMINI_API_KEY")
 console = Console()
 
 if not API_KEY:
-    console.print("[red]❌ 錯誤: 請在 .env 設定 GEMINI_API_KEY[/]")
+    Logger.error("請在 .env 設定 GEMINI_API_KEY")
     sys.exit(1)
 
 # 初始化核心
+Logger.info("正在啟動 Gemini Agent v12.1 (Debug Mode)...")
 memory_mgr = MemoryManager()
 lut_engine = LUTEngine()
 rag = KnowledgeBase()
 
-# 自動索引
 try:
     all_luts = lut_engine.list_luts()
     if all_luts:
         rag.index_luts(all_luts)
 except Exception as e:
-    console.print(f"[yellow]⚠️ 索引建立警告: {e}[/]")
+    Logger.warn(f"索引建立警告: {e}")
 
 planner = SmartPlanner(API_KEY, rag)
 
 
-# ================= 工具函式 =================
-
+# 工具函式
 def remember_user_preference(info: str):
-    """記憶工具"""
-    console.print(f"[yellow]🧠 正在寫入記憶: {info}[/]")
+    Logger.info(f"寫入記憶: {info}")
     return memory_mgr.add_preference(info)
 
 
 def check_available_luts(keyword: str = ""):
-    """查詢工具 (現在使用 LUTEngine 的索引，極快)"""
-    console.print(f"[dim]🔍 查詢 LUT 索引 (關鍵字: {keyword})...[/]")
+    Logger.debug(f"查詢 LUT: {keyword}")
     all_names = list(lut_engine.lut_index.keys())
-
     if keyword:
         filtered = [n for n in all_names if keyword.lower() in n]
-        if not filtered:
-            return f"找不到 '{keyword}'，共有 {len(all_names)} 個濾鏡。"
         return f"找到 {len(filtered)} 個：{', '.join(filtered[:20])}..."
-
     import random
-    if all_names:
-        sample = random.sample(all_names, min(len(all_names), 20))
-        return f"系統共有 {len(all_names)} 個濾鏡，例如：{', '.join(sample)}..."
-    return "系統目前沒有任何濾鏡。"
+    sample = random.sample(all_names, min(len(all_names), 20))
+    return f"系統共有 {len(all_names)} 個濾鏡，例如：{', '.join(sample)}..."
 
 
 def create_chat_session():
-    """建立 Session (使用安全指令工具)"""
     genai.configure(api_key=API_KEY)
-
-    # 使用 execute_safe_command
     tools = [execute_safe_command, remember_user_preference, check_available_luts]
-
     base_prompt = """
     你是一個強大的 AI 助理 (Gemini 3 Pro)。
-
-    【安全守則】
-    1. 執行指令前，請使用 execute_safe_command。
-    2. 遇到無法執行的指令 (被攔截)，請誠實告知使用者權限不足。
-
-    【能力】
-    1. 修圖：引導至視覺模式。
-    2. 查詢濾鏡：使用 check_available_luts。
-    3. 記憶：使用 remember_user_preference。
+    【安全守則】執行指令前請用 execute_safe_command。
+    【能力】修圖、查詢濾鏡、記憶偏好。
     """
-
     dynamic_context = memory_mgr.get_system_prompt_addition()
-
     model = genai.GenerativeModel(
         model_name='gemini-3-pro-preview',
         tools=tools,
@@ -106,7 +84,7 @@ def create_chat_session():
     return model.start_chat(enable_automatic_function_calling=True)
 
 
-# ================= 介面邏輯 =================
+# 介面邏輯
 def get_input_safe(prompt_text):
     while True:
         try:
@@ -144,21 +122,17 @@ def select_files_from_directory(dir_path):
             pass
 
 
-# ================= 主程式 =================
 async def main():
     console.clear()
-    console.print(Panel.fit("[bold cyan]🤖 Gemini Agent v11 (AI Retoucher)[/]", border_style="cyan"))
-    console.print(f"[dim]✅ 系統就緒：已載入 {len(all_luts)} 個濾鏡 | 雙核大腦已連線[/]\n")
+    console.print(Panel.fit("[bold cyan]🤖 Gemini Agent v12.1 (Debug Mode)[/]", border_style="cyan"))
 
     while True:
         try:
             console.print("\n[dim]──────────────────────────────────────────────────[/]")
             user_input = get_input_safe("[yellow]請輸入 [bold white]圖片路徑[/] 或 [bold white]指令/聊天[/]: [/]")
-
             if user_input is None:
                 if Confirm.ask("\n[bold yellow]要離開程式嗎？[/]"): break
                 continue
-
             if user_input.lower() in ["exit", "quit"]: break
 
             raw_input = user_input.replace('"', '').replace("'", "")
@@ -169,7 +143,7 @@ async def main():
 
             if os.path.exists(target_path):
                 # 🖼️ 視覺模式
-                console.print("[bold cyan]🖼️ 偵測到圖片，進入視覺模式[/]")
+                console.print("[bold cyan]🖼️ 進入視覺模式[/]")
                 target_files = []
                 if os.path.isdir(target_path):
                     target_files = select_files_from_directory(target_path)
@@ -181,7 +155,6 @@ async def main():
                 style_req = get_input_safe("[green]🎨 請描述風格: [/]")
                 if not style_req: continue
 
-                console.print(f"\n[bold cyan]🚀 Smart Planner 思考中...[/]")
                 try:
                     iterator = track(target_files, description="修圖進度") if count > 1 else target_files
                     for img_path in iterator:
@@ -189,31 +162,32 @@ async def main():
 
                         if plan and plan.get('selected_lut'):
                             if count == 1:
-                                # v11: 顯示詳細參數
                                 console.print(Panel(
-                                    f"策略: {plan.get('reasoning', '無')}\n"
+                                    f"技術分析: {plan.get('technical_analysis', '無')}\n"
+                                    f"調色策略: {plan.get('style_strategy', '無')}\n"
                                     f"LUT: {plan['selected_lut']} (強度 {plan.get('intensity', 1.0)})\n"
-                                    f"修整: 亮({plan.get('brightness', 1.0)}) 飽({plan.get('saturation', 1.0)}) 溫({plan.get('temperature', 0.0)})",
+                                    f"參數: 亮({plan.get('brightness')}) 對({plan.get('contrast')}) 溫({plan.get('temperature')}) 調({plan.get('tint')})",
                                     title="AI 決策面板"
                                 ))
 
-                            # [v11 關鍵] 傳遞所有新參數給引擎
                             final_img, msg = lut_engine.apply_lut(
                                 img_path,
                                 plan['selected_lut'],
                                 intensity=plan.get('intensity', 1.0),
                                 brightness=plan.get('brightness', 1.0),
                                 saturation=plan.get('saturation', 1.0),
-                                temperature=plan.get('temperature', 0.0)
+                                temperature=plan.get('temperature', 0.0),
+                                tint=plan.get('tint', 0.0),
+                                contrast=plan.get('contrast', 1.0)
                             )
 
                             if final_img:
                                 if not os.path.exists("output"): os.makedirs("output")
-                                save_path = f"output/v11_{os.path.basename(img_path)}"
+                                save_path = f"output/v12_{os.path.basename(img_path)}"
                                 final_img.save(save_path)
-                                console.print(f"   [green]✅ 儲存: {save_path}[/]")
+                                Logger.success(f"已儲存: {save_path}")
                 except KeyboardInterrupt:
-                    console.print("\n[bold yellow]🛑 視覺任務已暫停[/]")
+                    Logger.warn("視覺任務已暫停")
 
             else:
                 # 💬 對話模式
@@ -227,15 +201,15 @@ async def main():
                             border_style="magenta"
                         ))
                 except KeyboardInterrupt:
-                    console.print("\n[bold yellow]🛑 對話已取消[/]")
+                    Logger.warn("對話已取消")
                 except Exception as e:
-                    console.print(f"[red]❌ 對話發生錯誤: {e}[/]")
+                    Logger.error(f"對話錯誤: {e}")
 
         except KeyboardInterrupt:
             console.print("\n[bold yellow]⚠️ (已攔截中斷訊號)[/]")
             continue
         except Exception as e:
-            console.print(f"\n[bold red]💥 系統錯誤: {e}[/]")
+            Logger.error(f"系統崩潰攔截: {e}")
             await asyncio.sleep(1)
             continue
 
