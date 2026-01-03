@@ -1,24 +1,14 @@
 import os
 import sys
-import asyncio
-from dotenv import load_dotenv
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Prompt, Confirm
 from rich.table import Table
-from rich.markdown import Markdown
 from rich.progress import track
-import warnings
 
-warnings.simplefilter('ignore')
-
-from core.lut_engine import LUTEngine
-from core.rag_core import KnowledgeBase
-from core.smart_planner import SmartPlanner
-from core.memory_manager import MemoryManager
-from core.security import execute_safe_command
+# 匯入 v17 核心
+from core.style_engine import StyleEngine  # 改用 StyleEngine
+from core.logic_planner import LogicPlanner
 from core.logger import Logger
-from core.gemini_client import GeminiClient
 
 if sys.platform.startswith('win'):
     try:
@@ -27,61 +17,12 @@ if sys.platform.startswith('win'):
     except Exception:
         pass
 
-load_dotenv()
-API_KEY = os.getenv("GEMINI_API_KEY")
 console = Console()
+Logger.info("正在啟動 v17 Pure Math Edition (No LUTs)...")
 
-if not API_KEY:
-    Logger.error("請在 .env 設定 GEMINI_API_KEY")
-    sys.exit(1)
-
-Logger.info("正在啟動 Gemini Agent v16.2 (Unified Memory & Safe Mode)...")
-
-memory_mgr = MemoryManager()
-lut_engine = LUTEngine()
-rag = KnowledgeBase()
-
-try:
-    all_luts = lut_engine.list_luts()
-    if all_luts:
-        rag.index_luts(all_luts)
-except Exception as e:
-    Logger.warn(f"索引建立警告: {e}")
-
-planner = SmartPlanner(API_KEY, rag, lut_engine)
-client = GeminiClient(API_KEY)
-
-
-# ================= 工具函式 =================
-
-def remember_user_preference(info: str):
-    Logger.info(f"寫入記憶: {info}")
-    return memory_mgr.add_preference(info)
-
-
-def check_available_luts(keyword: str = ""):
-    Logger.debug(f"查詢 LUT: {keyword}")
-    all_names = list(lut_engine.lut_index.keys())
-    if keyword:
-        filtered = [n for n in all_names if keyword.lower() in n]
-        if not filtered:
-            return "沒有找到符合的濾鏡。"
-        return f"找到 {len(filtered)} 個：{', '.join(filtered[:20])}..."
-    return f"系統共有 {len(all_names)} 個濾鏡。"
-
-
-def create_chat_session():
-    tools = [execute_safe_command, remember_user_preference, check_available_luts]
-    base_prompt = """
-    你是一個強大的 AI 助理 (Gemini 3 Pro)。
-    【能力】修圖、查詢濾鏡、記憶偏好。
-    請用繁體中文回答。
-    """
-    dynamic_context = memory_mgr.get_system_prompt_addition()
-    return client.create_unified_chat(
-        tools=tools,
-        system_instruction=base_prompt + dynamic_context
-    )
+# 初始化
+style_engine = StyleEngine()
+planner = LogicPlanner(style_engine)
 
 
 def get_input_safe(prompt_text):
@@ -122,146 +63,81 @@ def select_files_from_directory(dir_path):
             pass
 
 
-# [New] 安全獲取文字回應的輔助函式
-def get_response_text_safe(response):
-    try:
-        return response.text
-    except Exception:
-        # 如果沒有 text part (例如只有 function call)，手動檢查 parts
-        if hasattr(response, 'parts'):
-            for part in response.parts:
-                if hasattr(part, 'text') and part.text:
-                    return part.text
-        return "✅ 指令已執行 (無文字回應)"
-
-
-async def main():
+def main():
     console.clear()
-    console.print(Panel.fit("[bold cyan]🤖 Gemini Agent v16.2 (Ultimate Edition)[/]", border_style="cyan"))
-
-    cli_chat_session = None
+    console.print(Panel.fit("[bold magenta]✨ v17 Pure Math (參數化運算版)[/]", border_style="magenta"))
 
     while True:
         try:
             console.print("\n[dim]──────────────────────────────────────────────────[/]")
-            user_input = get_input_safe("[yellow]請輸入 [bold white]圖片路徑[/] 或 [bold white]指令/聊天[/]: [/]")
+            user_input = get_input_safe("[yellow]請輸入 [bold white]圖片路徑[/] (輸入 q 離開): [/]")
 
-            if user_input is None:
-                if Confirm.ask("\n[bold yellow]要離開程式嗎？[/]"): break
-                continue
-            if user_input.lower() in ["exit", "quit"]: break
+            if user_input is None or user_input.lower() in ["exit", "quit", "q"]:
+                break
 
-            raw_input = user_input.replace('"', '').replace("'", "")
-            target_path = raw_input
-
+            target_path = user_input.replace('"', '').replace("'", "")
             if not os.path.exists(target_path):
                 check_input = os.path.join("input", target_path)
-                if os.path.exists(check_input): target_path = check_input
-
-            if os.path.exists(target_path):
-                # 🖼️ 進入視覺模式
-                console.print("[bold cyan]🖼️ 進入視覺模式[/]")
-                target_files = []
-                if os.path.isdir(target_path):
-                    target_files = select_files_from_directory(target_path)
-                    if not target_files: continue
+                if os.path.exists(check_input):
+                    target_path = check_input
                 else:
-                    target_files = [target_path]
+                    Logger.error("找不到路徑")
+                    continue
 
-                count = len(target_files)
-                style_req = get_input_safe("[green]🎨 請描述風格: [/]")
-                if not style_req: continue
-
-                last_plan = None
-
-                try:
-                    iterator = track(target_files, description="修圖進度") if count > 1 else target_files
-
-                    for img_path in iterator:
-                        plan = await asyncio.to_thread(planner.generate_plan, img_path, style_req)
-                        last_plan = plan
-
-                        if plan and plan.get('selected_lut'):
-                            if count == 1:
-                                mix_info = f" + {plan.get('secondary_lut')} ({plan.get('mix_ratio')})" if plan.get(
-                                    'secondary_lut') else ""
-                                console.print(Panel(
-                                    f"策略: {plan.get('style_strategy', '無')}\n"
-                                    f"LUT: {plan['selected_lut']}{mix_info}\n"
-                                    f"曲線: {plan.get('curve_points', 'Default')}",
-                                    title="AI 煉金術決策"
-                                ))
-
-                            final_img, msg = lut_engine.apply_lut(
-                                img_path,
-                                plan['selected_lut'],
-                                intensity=plan.get('intensity', 1.0),
-                                brightness=plan.get('brightness', 1.0),
-                                saturation=plan.get('saturation', 1.0),
-                                temperature=plan.get('temperature', 0.0),
-                                tint=plan.get('tint', 0.0),
-                                contrast=plan.get('contrast', 1.0),
-                                curve_points=plan.get('curve_points'),
-                                sharpness=plan.get('sharpness', 1.0),
-                                simulate_log=plan.get('simulate_log', False),
-                                secondary_lut=plan.get('secondary_lut'),
-                                mix_ratio=plan.get('mix_ratio', 0.0)
-                            )
-
-                            if final_img:
-                                if not os.path.exists("output"): os.makedirs("output")
-                                save_path = f"output/v16_{os.path.basename(img_path)}"
-                                final_img.save(save_path)
-                                Logger.success(f"已儲存: {save_path}")
-                        else:
-                            Logger.error("AI 未生成有效計畫 (無可用 LUT)")
-
-                    if count == 1 and last_plan and last_plan.get('selected_lut'):
-                        console.print("\n[bold yellow]🤔 滿意這次的結果嗎？[/]")
-                        if Confirm.ask("正向樣本 (記住風格)?"):
-                            planner.learn_from_result(style_req, last_plan, 1)
-                            console.print("[green]✅ 已記錄！AI 記住了這個風格參數。[/]")
-                        else:
-                            if Confirm.ask("負向樣本 (避雷)?"):
-                                planner.learn_from_result(style_req, last_plan, -1)
-                                console.print("[red]❎ 已記錄避雷針！下次會避開此設定。[/]")
-
-                except KeyboardInterrupt:
-                    Logger.warn("視覺任務已暫停")
-
+            target_files = []
+            if os.path.isdir(target_path):
+                target_files = select_files_from_directory(target_path)
+                if not target_files: continue
             else:
-                # 💬 進入對話模式
-                if cli_chat_session is None:
-                    cli_chat_session = create_chat_session()
+                target_files = [target_path]
 
-                try:
-                    with console.status("[bold magenta]🧠 Gemini 3 Pro 思考中...[/]", spinner="dots"):
-                        response = await asyncio.to_thread(cli_chat_session.send_message, user_input)
+            count = len(target_files)
+            style_req = get_input_safe("[green]🎨 請輸入關鍵字 (如: 日系, 柯達, 賽博, 黑白): [/]")
+            if not style_req: continue
 
-                        # [Fix] 使用安全函式讀取回應
-                        resp_text = get_response_text_safe(response)
+            try:
+                iterator = track(target_files, description="⚡ 數學運算中...") if count > 1 else target_files
 
-                        console.print(Panel(
-                            Markdown(resp_text),
-                            title="🤖 Gemini 3 Pro",
-                            border_style="magenta"
-                        ))
-                except KeyboardInterrupt:
-                    Logger.warn("對話已取消")
-                except Exception as e:
-                    Logger.error(f"對話錯誤: {e}")
+                for img_path in iterator:
+                    # 1. 邏輯決策
+                    plan = planner.generate_plan(img_path, style_req)
+
+                    # 2. 執行數學引擎
+                    # 注意：這裡的參數傳遞方式變了
+                    final_img, msg = style_engine.apply_style(
+                        img_path,
+                        style_name=plan['selected_style'],
+                        intensity=plan['intensity'],
+                        # 傳遞動態修正參數 (Overrides)
+                        brightness=plan.get('brightness'),
+                        contrast=plan.get('contrast'),
+                        temp=plan.get('temperature')
+                    )
+
+                    if final_img:
+                        if not os.path.exists("output"): os.makedirs("output")
+                        save_path = f"output/v17_{os.path.basename(img_path)}"
+                        final_img.save(save_path)
+
+                        if count == 1:
+                            console.print(Panel(
+                                f"風格: {plan['selected_style']}\n"
+                                f"修正: Bright {plan.get('brightness')} / Temp {plan.get('temperature')}",
+                                title="v17 運算結果"
+                            ))
+                            Logger.success(f"已儲存: {save_path}")
+                    else:
+                        Logger.error(f"運算失敗: {msg}")
+
+            except KeyboardInterrupt:
+                Logger.warn("任務已暫停")
 
         except KeyboardInterrupt:
-            console.print("\n[bold yellow]⚠️ (中斷)[/]")
-            continue
+            break
         except Exception as e:
-            Logger.error(f"系統崩潰攔截: {e}")
-            await asyncio.sleep(1)
+            Logger.error(f"未預期錯誤: {e}")
             continue
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("Bye.")
+    main()
