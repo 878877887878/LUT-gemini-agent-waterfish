@@ -4,6 +4,7 @@ import re
 import google.generativeai as genai
 from PIL import Image
 from core.logger import Logger
+from core.feedback_manager import FeedbackManager
 
 
 class SmartPlanner:
@@ -11,81 +12,62 @@ class SmartPlanner:
         genai.configure(api_key=api_key)
         self.rag = rag_engine
         self.model = genai.GenerativeModel('gemini-3-pro-preview')
-        Logger.info("SmartPlanner (Gemini 3 Pro) 初始化完成")
+        self.feedback = FeedbackManager()
 
     def _extract_json(self, text):
-        """
-        使用 Regex 強制提取 JSON 物件 (忽略 Markdown 符號或廢話)
-        """
         try:
             match = re.search(r'\{.*\}', text, re.DOTALL)
-            if match:
-                return json.loads(match.group(0))
-        except Exception as e:
-            Logger.warn(f"JSON 提取失敗: {e}")
+            if match: return json.loads(match.group(0))
+        except:
+            pass
         return None
 
     def generate_plan(self, image_path, user_request):
         Logger.info(f"開始策劃修圖: {user_request}")
 
-        # 1. RAG 檢索：給 AI 足夠多的選擇 (60個)
+        # RAG 檢索
         available_luts = self.rag.search(user_request, n_results=60)
+        rl_context = self.feedback.get_learning_context(user_request)
 
-        # 2. Prompt (v15: 上下文感知 + 權重修正)
+        # v16 Prompt: LUT 煉金術指令
         prompt = f"""
-        你是一位好萊塢等級的 DI (Digital Intermediate) 專業調色師。
-        請分析圖片並制定修圖計畫。
+        你是一位 DI 專業調色師。你的目標是透過「混合」與「參數生成」來創造完美的影像，而不僅僅是套用現成濾鏡。
 
-        【使用者當前需求】
-        "{user_request}"
+        【使用者需求】"{user_request}"
+        {rl_context}
 
-        【 📚 可用 LUT 資源庫 】
+        【 🧪 LUT 倉庫 (用於解析與重組) 】
         {available_luts}
 
-        【 ⚠️ 決策邏輯 (Priority Rules) 】
-        1. **指令優先權 (Context First)**: 
-           - 你的系統 Prompt 可能包含使用者的「長期偏好」(如: 喜歡日系冷白)。
-           - **但是**，如果「當前需求」明確指定了相反風格 (如: "聖誕風格", "暖色", "復古")，請**務必忽略長期偏好**，以當前需求為準。
-           - 只有當使用者說 "隨便"、"老樣子" 時，才使用長期偏好。
+        【 🛠️ v16 煉金術決策 (Alchemy Strategy) 】
+        1. **LUT 混合 (Hybrid Generation)**:
+           - 如果單一 LUT 無法滿足需求（例如：想要 ETERNA 的質感但要 Kodak 的暖色），請使用混合模式。
+           - `selected_lut`: 主風格 (Base)
+           - `secondary_lut`: 副風格 (Tint/Atmosphere)，可從清單中選一個互補的。
+           - `mix_ratio`: 混合比例 (0.0~1.0)。例如 0.3 代表 30% 副風格 + 70% 主風格。
 
-        2. **風格參數指引**:
-           - **聖誕/溫馨/暖色**: 
-             - 選擇暖色調 LUT。
-             - 設定 `temperature`: 0.1 ~ 0.3 (偏暖)。
-             - 設定 `saturation`: 1.0 ~ 1.2 (色彩飽滿)。
-             - 設定 `contrast`: 1.0 ~ 1.1 (增加氛圍)。
-           - **日系/冷白/科技**: 
-             - 選擇冷色調 LUT。
-             - 設定 `temperature`: -0.1 ~ -0.3 (偏冷)。
-             - 設定 `saturation`: 0.7 ~ 0.9 (低飽和)。
-             - 設定 `contrast`: 0.9 (柔和)。
+        2. **曲線生成 (Curve Baking)**:
+           - 分析現有 LUT 的缺點 (例如: 暗部太黑)，利用 `curve_points` 修正它。
+           - 範例: `[[0,10], [50,55], [255,255]]` (提亮黑位，製造消光感)。
 
-        3. **Log LUT 防呆 (Log Detection)**:
-           - 如果 selected_lut 檔名包含 "Log", "Raw", "Flat" 且原圖是 JPG (標準對比)。
-           - 必須設定 `simulate_log: true` (開啟 Log 模擬器)。
-           - 若開啟模擬，`intensity` 設為 1.0；若未開啟模擬但選了 Log LUT，`intensity` 強制降至 0.3。
+        3. **Log 防呆**: (同 v14, 遇 Log LUT 開啟模擬)
 
-        【 🛠️ 輸出參數定義 】
-        - `curve`: "S-Curve"(電影感), "Soft-High"(柔化高光/富士感), "Linear"(無)
-        - `sharpness`: 0.0~2.0 (數位照片建議 0.8~0.9 去除銳利感)
-        - `temperature`/`tint`: 白平衡修正 (-1.0 ~ 1.0)
-        - `brightness`/`contrast`/`saturation`: 基礎修正 (1.0 為基準)
-
-        請回傳 **純 JSON 格式**：
+        請回傳 JSON：
         {{
-            "technical_analysis": "原圖分析...",
-            "style_strategy": "因使用者要求聖誕風格，故忽略長期記憶中的冷白偏好，改用暖色調策略...",
-            "selected_lut": "完整檔名.cube",
+            "technical_analysis": "...",
+            "style_strategy": "解析發現單用 ETERNA 太冷，決定混合 30% Portra 400 來增加聖誕暖度...",
+            "selected_lut": "主LUT檔名.cube",
+            "secondary_lut": "副LUT檔名.cube", 
+            "mix_ratio": 0.3,
             "simulate_log": false,
             "intensity": 0.8,
             "brightness": 1.0,
-            "contrast": 1.0,
             "saturation": 1.0,
             "temperature": 0.0,
             "tint": 0.0,
-            "curve": "Linear",
+            "curve_points": [[0,0], [255,255]],
             "sharpness": 1.0,
-            "caption": "IG文案..."
+            "caption": "..."
         }}
         """
 
@@ -93,60 +75,34 @@ class SmartPlanner:
             if not os.path.isfile(image_path):
                 return {"selected_lut": None, "reasoning": "找不到圖片"}
 
-            # 製作縮圖以加速 API 上傳 (1024px 足夠 AI 判斷光影與構圖)
             temp_thumb = "temp_analysis_thumb.jpg"
             with Image.open(image_path) as img:
                 img.thumbnail((1024, 1024))
                 img.save(temp_thumb, quality=85)
 
             img_file = genai.upload_file(temp_thumb)
-            Logger.debug("圖片已上傳至 Gemini，等待分析...")
-
             response = self.model.generate_content([prompt, img_file])
-
-            # 提取 JSON
             plan = self._extract_json(response.text)
 
-            # --- v15 安全檢查與防呆機制 ---
-            if plan and plan.get('selected_lut'):
-                lut_name = plan['selected_lut'].lower()
-                is_log_lut = any(x in lut_name for x in ['log', 'raw', 'flat'])
+            # v16 參數防呆
+            if plan:
+                # 確保混合參數存在
+                if 'secondary_lut' not in plan: plan['secondary_lut'] = None
+                if 'mix_ratio' not in plan: plan['mix_ratio'] = 0.0
 
-                # 防呆 1: 如果是 Log LUT 但 AI 忘了開模擬，強制幫它開
-                if is_log_lut and not plan.get('simulate_log'):
-                    Logger.warn(f"偵測到 Log LUT ({lut_name}) 但 AI 未啟用模擬，強制啟用 Log Simulation。")
+                # Log 防呆
+                lut_name = str(plan.get('selected_lut', '')).lower()
+                is_log = any(x in lut_name for x in ['log', 'raw', 'flat'])
+                if is_log and not plan.get('simulate_log'):
+                    Logger.warn("v16 自動修正: 強制啟用 Log 模擬")
                     plan['simulate_log'] = True
-                    plan['intensity'] = 1.0  # 模擬模式下強度需全開才準
-
-                # 防呆 2: 確保數值型別正確 (防止 AI 回傳字串導致報錯)
-                for key in ['intensity', 'brightness', 'contrast', 'saturation', 'temperature', 'tint', 'sharpness']:
-                    if key in plan:
-                        try:
-                            plan[key] = float(plan[key])
-                        except:
-                            plan[key] = 1.0 if key not in ['temperature', 'tint'] else 0.0
-
-            else:
-                # 保底策略 (Fallback)
-                Logger.warn("AI 回傳格式錯誤或未選擇 LUT，啟動 Fallback 策略")
-                return {
-                    "technical_analysis": "解析失敗",
-                    "style_strategy": "Fallback (使用預設值)",
-                    "selected_lut": available_luts[0] if available_luts else None,
-                    "simulate_log": False,
-                    "intensity": 0.7,
-                    "brightness": 1.0,
-                    "contrast": 1.0,
-                    "saturation": 1.0,
-                    "temperature": 0.0,
-                    "tint": 0.0,
-                    "curve": "Linear",
-                    "sharpness": 1.0,
-                    "caption": "AI 自動修圖"
-                }
+                    plan['intensity'] = 1.0
 
             return plan
 
         except Exception as e:
-            Logger.error(f"SmartPlanner 發生錯誤: {e}")
+            Logger.error(f"Planner Error: {e}")
             return {"selected_lut": None, "reasoning": str(e)}
+
+    def learn_from_result(self, user_req, plan, score):
+        self.feedback.record_feedback(user_req, plan, score)

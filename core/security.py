@@ -28,16 +28,13 @@ def execute_safe_command(command: str):
     try:
         Logger.debug(f"執行指令: {command}")
 
-        # v15 關鍵修正：
-        # 1. shell=True 在 Windows 會使用 cmd.exe，其編碼通常是 cp950 (Big5)
-        # 2. 我們嘗試用 utf-8 解碼，若失敗則用 errors='replace' 忽略亂碼，防止 Crash
         result = subprocess.run(
             command,
             shell=True,
             capture_output=True,
             text=True,
             encoding='utf-8',
-            errors='replace',  # [Fix] 遇到無法解碼的字元用 ? 取代，不要報錯
+            errors='replace',  # [Fix] 遇到無法解碼的字元用 ? 取代
             timeout=30
         )
 

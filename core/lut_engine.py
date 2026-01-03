@@ -2,11 +2,12 @@ import os
 import PIL.Image
 import PIL.ImageOps
 import PIL.ImageEnhance
+import numpy as np
 from pillow_lut import load_cube_file
 from functools import lru_cache
 from collections import defaultdict
 import difflib
-import numpy as np
+from scipy.interpolate import PchipInterpolator
 from core.logger import Logger
 
 
@@ -14,6 +15,7 @@ class LUTEngine:
     def __init__(self, lut_dir="luts"):
         self.lut_dir = lut_dir
         self.lut_index = defaultdict(list)
+        self.usage_history = defaultdict(int)
         self._build_index()
 
     def _build_index(self):
@@ -36,33 +38,41 @@ class LUTEngine:
     def _get_lut_object(self, lut_path):
         return load_cube_file(lut_path)
 
+    def _generate_spline_curve(self, img, points):
+        if not points or len(points) < 2: return img
+        # ... (保留 v15 的曲線邏輯) ...
+        points.sort(key=lambda x: x[0])
+        x_points, y_points = zip(*points)
+        interp = PchipInterpolator(x_points, y_points)
+        x_axis = np.arange(256)
+        y_axis = np.clip(interp(x_axis), 0, 255).astype(np.uint8)
+        table = y_axis.tolist() * 3
+        return img.point(table)
+
+    def _find_lut_path(self, lut_name):
+        """輔助函式：尋找 LUT 路徑"""
+        if not lut_name: return None
+        if os.path.exists(lut_name): return lut_name
+
+        lookup = os.path.basename(lut_name).lower()
+        candidates = self.lut_index.get(lookup)
+        if candidates: return candidates[0]
+
+        # 模糊搜尋
+        all_keys = list(self.lut_index.keys())
+        matches = difflib.get_close_matches(lookup, all_keys, n=1, cutoff=0.6)
+        if matches: return self.lut_index[matches[0]][0]
+        return None
+
     def _simulate_log_curve(self, img):
-        """
-        v14 關鍵技術：將 Rec.709 照片「洗白」成偽 Log
-        透過降低對比、提亮暗部、壓縮高光，創造適合 Log LUT 的灰底。
-        """
-        Logger.debug("執行 Log 模擬 (將照片變灰以適配 Log LUT)...")
-
-        # 1. 大幅降低對比 (變平)
+        # ... (保留 v14 的 Log 模擬) ...
         img = PIL.ImageEnhance.Contrast(img).enhance(0.6)
-
-        # 2. 降低飽和度 (Log 通常飽和度低)
         img = PIL.ImageEnhance.Color(img).enhance(0.7)
-
-        # 3. 提升亮度 (Log 的暗部通常是灰的不是黑的)
         img = PIL.ImageEnhance.Brightness(img).enhance(1.1)
-
-        # 4. Gamma 修正 (讓中間調更灰)
-        # 這裡用簡單的曲線模擬 Log 的 lift
-        r, g, b = img.split()
-        lift_curve = lambda x: int(x * 0.9 + 15)  # 簡單的線性提亮
-        r = r.point(lift_curve)
-        g = g.point(lift_curve)
-        b = b.point(lift_curve)
-
-        return PIL.Image.merge("RGB", (r, g, b))
+        return img
 
     def _adjust_white_balance(self, img, temp_val, tint_val):
+        # ... (保留 v14 的白平衡) ...
         if temp_val == 0 and tint_val == 0: return img
         r, g, b = img.split()
         r_factor = 1.0 + (temp_val * 0.25)
@@ -73,33 +83,16 @@ class LUTEngine:
         b = b.point(lambda i: int(min(255, max(0, i * b_factor))))
         return PIL.Image.merge("RGB", (r, g, b))
 
-    def _apply_curve(self, img, curve_type):
-        if curve_type == "Linear" or not curve_type: return img
-        # (保留 v13 的曲線邏輯)
-        x = np.arange(256)
-        if curve_type == "S-Curve":
-            factor = 5
-            y = 255 / (1 + np.exp(-factor * (x / 255 - 0.5)))
-            y = (y - y.min()) * 255 / (y.max() - y.min())
-        elif curve_type == "Soft-High":
-            y = np.where(x < 128, x, 128 + (x - 128) * 0.8)
-        elif curve_type == "Lift-Shadow":
-            y = np.where(x > 64, x, x + (64 - x) * 0.3)
-        else:
-            return img
-        table = y.astype(np.uint8).tolist() * 3
-        return img.point(table)
-
     def apply_lut(self, image_path, lut_name_or_path, intensity=1.0,
                   brightness=1.0, saturation=1.0, temperature=0.0, tint=0.0,
-                  contrast=1.0, curve="Linear", sharpness=1.0,
-                  simulate_log=False):  # [v14 新增參數]
+                  contrast=1.0, curve_points=None, sharpness=1.0,
+                  simulate_log=False,
+                  secondary_lut=None, mix_ratio=0.0):  # [v16 新增混合參數]
         try:
             with PIL.Image.open(image_path) as im:
                 img = PIL.ImageOps.exif_transpose(im).convert("RGB")
 
-            # --- Step 0: Log Simulation (v14 新增) ---
-            # 如果 AI 判斷這是一個 Log LUT，我們先把照片變灰！
+            # --- Step 0: Log Simulation ---
             if simulate_log:
                 img = self._simulate_log_curve(img)
 
@@ -108,48 +101,64 @@ class LUTEngine:
                 img = PIL.ImageEnhance.Brightness(img).enhance(brightness)
             if temperature != 0 or tint != 0:
                 img = self._adjust_white_balance(img, temperature, tint)
-            if contrast != 1.0:
+
+            # --- Step 2: Advanced Curve ---
+            if curve_points and isinstance(curve_points, list):
+                img = self._generate_spline_curve(img, curve_points)
+            elif contrast != 1.0:
                 img = PIL.ImageEnhance.Contrast(img).enhance(contrast)
+
             if saturation != 1.0:
                 img = PIL.ImageEnhance.Color(img).enhance(saturation)
 
-            # --- Step 2: Curve ---
-            img = self._apply_curve(img, curve)
+            # --- Step 3: LUT Mixing (Alchemy) [v16 核心] ---
+            # 找出主 LUT
+            path_a = self._find_lut_path(lut_name_or_path)
 
-            # --- Step 3: LUT ---
-            target_path = None
-            if os.path.exists(lut_name_or_path):
-                target_path = lut_name_or_path
+            # 找出副 LUT (若有)
+            path_b = self._find_lut_path(secondary_lut) if (secondary_lut and mix_ratio > 0) else None
+
+            processed_img = img  # 預設
+
+            if path_a:
+                self.usage_history[os.path.basename(path_a)] += 1
+                try:
+                    lut_a = self._get_lut_object(path_a)
+                    img_a = img.filter(lut_a)
+
+                    # 混合邏輯
+                    if path_b:
+                        Logger.info(
+                            f"🧪 執行 LUT 煉金術: {os.path.basename(path_a)} + {os.path.basename(path_b)} (Mix: {mix_ratio})")
+                        lut_b = self._get_lut_object(path_b)
+                        img_b = img.filter(lut_b)
+                        # 混合 A 和 B
+                        blended_lut_result = PIL.Image.blend(img_a, img_b, alpha=mix_ratio)
+
+                        # 再根據 intensity 與原圖混合
+                        if intensity < 1.0:
+                            processed_img = PIL.Image.blend(img, blended_lut_result, intensity)
+                        else:
+                            processed_img = blended_lut_result
+                    else:
+                        # 單一 LUT
+                        if intensity < 1.0:
+                            processed_img = PIL.Image.blend(img, img_a, intensity)
+                        else:
+                            processed_img = img_a
+
+                except Exception as e:
+                    Logger.error(f"LUT 應用失敗: {e}")
+                    return img, f"LUT Error: {e}"
             else:
-                lookup_name = os.path.basename(lut_name_or_path).lower()
-                candidates = self.lut_index.get(lookup_name)
-                if candidates:
-                    target_path = candidates[0]
-                else:
-                    all_keys = list(self.lut_index.keys())
-                    matches = difflib.get_close_matches(lookup_name, all_keys, n=1, cutoff=0.6)
-                    if matches: target_path = self.lut_index[matches[0]][0]
+                if lut_name_or_path != "AI_Generated_LUT":
+                    Logger.warn(f"找不到主 LUT: {lut_name_or_path}，僅執行基礎調色")
 
-            if not target_path:
-                return img, "找不到 LUT，僅執行基礎修圖"
-
-            intensity = max(0.0, min(1.0, float(intensity)))
-            try:
-                lut = self._get_lut_object(target_path)
-                filtered_img = img.filter(lut)
-            except Exception as e:
-                return None, f"LUT 檔案損壞: {e}"
-
-            if intensity < 1.0:
-                final_img = PIL.Image.blend(img, filtered_img, intensity)
-            else:
-                final_img = filtered_img
-
-            # --- Step 4: Post-processing ---
+            # --- Step 4: Sharpness ---
             if sharpness != 1.0:
-                final_img = PIL.ImageEnhance.Sharpness(final_img).enhance(sharpness)
+                processed_img = PIL.ImageEnhance.Sharpness(processed_img).enhance(sharpness)
 
-            return final_img, "成功"
+            return processed_img, "成功"
 
         except Exception as e:
             Logger.error(f"Engine Error: {e}")

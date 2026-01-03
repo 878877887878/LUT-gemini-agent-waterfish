@@ -15,7 +15,6 @@ class Logger:
 
     @staticmethod
     def debug(msg):
-        # 如果不想看太細，可以註解掉這行
         console.print(f"[dim]{Logger._timestamp()}[/] [cyan]DEBUG[/] {msg}")
 
     @staticmethod

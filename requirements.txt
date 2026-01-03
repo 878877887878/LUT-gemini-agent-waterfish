@@ -1,5 +1,7 @@
 google-generativeai
 python-dotenv
+scipy
+numpy
 rich
 Pillow
 pillow-lut
